@@ -1,0 +1,82 @@
+# amd-rocm-ollama: ollama serving Gemma 4 with ROCm 7.2.2 on Strix Halo (gfx1151).
+#
+# PREREQUISITE on the host (one-time):
+#     sudo systemctl stop ollama
+#     sudo systemctl disable ollama
+# The host's bundled ollama service collides with this container on port 11434
+# and on the model store at /usr/share/ollama/.ollama. See README.md.
+
+services:
+  ollama:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+      args:
+        CMAKEVERSION: "3.31.2"
+        NINJAVERSION: "1.12.1"
+    image: amd-rocm-ollama:7.2.2
+    container_name: ollama-rocm
+    restart: unless-stopped
+
+    # KFD = HSA kernel driver, DRI = render nodes. Both required for ROCm.
+    devices:
+      - "/dev/kfd"
+      - "/dev/dri"
+
+    # Numeric ids match the host: video=44, render=992. Names are also added so
+    # this still works on hosts where /etc/group inside the image happens to
+    # define them at different ids.
+    group_add:
+      - "video"
+      - "render"
+      - "44"
+      - "992"
+
+    cap_add:
+      - "SYS_PTRACE"
+    security_opt:
+      - "seccomp=unconfined"
+
+    ipc: host
+    shm_size: "16gb"
+
+    ports:
+      - "11434:11434"
+
+    volumes:
+      # Bind-mount the host's existing model store. Container runs as root and
+      # writes new pulls/manifests as root - that is fine because we disabled
+      # the host's ollama systemd service. See README for re-chown instructions.
+      - "/usr/share/ollama/.ollama:/root/.ollama"
+
+    environment:
+      OLLAMA_HOST: "0.0.0.0:11434"
+      OLLAMA_MODELS: "/root/.ollama/models"
+
+      # Surface ROCm GPU discovery in the logs (rocm/HSA per-device info).
+      OLLAMA_DEBUG: "2"
+
+      # Forces faUserSet=true at external/ollama/llm/server.go:195 so flash
+      # attention is requested even on devices the auto-policy would skip.
+      # Falls back to f16 KV cache silently if FA actually fails (server.go:240).
+      OLLAMA_FLASH_ATTENTION: "1"
+      OLLAMA_KV_CACHE_TYPE: "q8_0"
+
+      OLLAMA_KEEP_ALIVE: "24h"
+      OLLAMA_MAX_LOADED_MODELS: "1"
+      OLLAMA_NUM_PARALLEL: "1"
+
+      # Single-GPU host: pin to device 0 so ollama doesn't probe phantom devices.
+      ROCR_VISIBLE_DEVICES: "0"
+
+      # Server-wide context length is intentionally NOT set here. With
+      # OLLAMA_CONTEXT_LENGTH unset (default 0), ollama auto-picks per model
+      # (see external/ollama/envconfig/config.go:326). Clients ask for 256K via
+      # `options.num_ctx=262144` per request; smaller models stay small.
+
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "--show-error", "http://localhost:11434/api/tags"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 60s
