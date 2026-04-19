@@ -12,6 +12,17 @@ source against **ROCm 7.2.2** with native **gfx1151 (Strix Halo)** support, and 
   the container for live debugging.
 - Aggressive `gfx1151`-only rocBLAS pruning keeps image size manageable.
 
+> **Quick verification:** `make validate` runs the 9-layer test ladder
+> automatically (host kernel, MES firmware, HIP smoke, container health,
+> Ollama GPU discovery, small inference). `make validate-full` adds the
+> ~200K-token prefill at the end. See
+> [`docs/validation-tests.md`](docs/validation-tests.md) for what each
+> layer means and how to fix failures.
+>
+> **Hit a `Memory access fault by GPU` or `library=cpu`?** Run
+> `make mes-check` first — odds are it's the MES `0x83` firmware
+> regression. Fix is one command: `make install-mes-firmware && sudo reboot`.
+
 ---
 
 ## Hardware tested
@@ -31,58 +42,111 @@ source against **ROCm 7.2.2** with native **gfx1151 (Strix Halo)** support, and 
 
 ## Prerequisites (one-time, on host)
 
-### 1. Kernel cmdline must enable the AMD IOMMU
+### 1. Replace Ubuntu's broken MES firmware on Strix Halo
 
-**This is mandatory on Strix Halo.** The iGPU's GTT (Graphics Translation
-Table) needs the AMD IOMMU to translate host virtual addresses into
-GPU-visible physical pages. With `amd_iommu=off` on the kernel cmdline,
-*every* `hipMemcpy` host→device produces a `[gfxhub] page fault
-... GCVM_L2_PROTECTION_FAULT_STATUS:0x00800932` (UTCL2 client `CPF`,
-`WALKER_ERROR=1`, `MAPPING_ERROR=1`). ROCm appears to load fine
-(`rocminfo` shows `gfx1151`, `rocblas_create_handle` succeeds), but the
-first GPU memory access faults and Ollama silently falls back to CPU
-(`vram-based default context: total_vram="0 B"`).
+**Single most important host-side fix.** The `linux-firmware` package
+shipping with current Ubuntu Noble (`20240318.git3b128b60-0ubuntu2.x`)
+includes an updated MES (Micro Engine Scheduler) firmware blob for
+`gfx11_5_1` (Strix Halo) at version `0x83`. That version mismatches the
+Linux KFD driver's expectation of the compute virtual-address layout, so
+**every compute kernel — host or container, with or without the IOMMU on
+— faults at the first dispatch**:
 
-Check current state:
+```
+amdgpu 0000:c6:00.0: amdgpu: [gfxhub] page fault ...
+GCVM_L2_PROTECTION_FAULT_STATUS:0x00800932
+Faulty UTCL2 client ID: CPF (0x4)  WALKER_ERROR: 0x1  MAPPING_ERROR: 0x1
+```
+
+Container side, this surfaces as `Memory access fault by GPU node-1`
+followed by Ollama silently falling back to
+`library=cpu  total_vram="0 B"`. Confirmed by AMD engineers in
+[ROCm/ROCm#5724](https://github.com/ROCm/ROCm/issues/5724),
+[#6118](https://github.com/ROCm/ROCm/issues/6118),
+[#6146](https://github.com/ROCm/ROCm/issues/6146), and
+[Ubuntu bug 2129150](https://bugs.launchpad.net/bugs/2129150).
+
+**Detection:**
+
+```bash
+sudo cat /sys/kernel/debug/dri/1/amdgpu_firmware_info | grep '^MES feature'
+```
+
+| Output                                        | Verdict                |
+| --------------------------------------------- | ---------------------- |
+| `MES feature version: 1, firmware version: 0x00000083` | **BROKEN — apply the fix below** |
+| `MES feature version: 1, firmware version: 0x00000080` (or lower) | OK                     |
+
+**Fix:** one command, then reboot:
+
+```bash
+make install-mes-firmware    # equivalent to: sudo ./scripts/install-mes-firmware.sh
+sudo reboot
+make mes-check               # verify; expects: MES firmware running: 0x00000080 (or lower)
+```
+
+The script downloads the pre-regression `gc_11_5_1_*` blobs from upstream
+`linux-firmware` git commit `e2c1b15108…` (2025-07-16, the last commit
+before the `0x83` update), verifies their md5 against known-good values,
+installs them as `/lib/firmware/updates/amdgpu/` overrides (this
+directory has precedence over `/lib/firmware/amdgpu/` and survives
+`apt upgrade linux-firmware`), and rebuilds the running kernel's
+initramfs so the override loads at very early boot. It is idempotent;
+re-running with the same firmware commit is a no-op.
+
+If you'd rather do it by hand (or use a different upstream commit), the
+full procedure plus all script options are documented in
+[`scripts/README.md`](scripts/README.md). The diagnostic story and list
+of false trails that *almost* looked like fixes (IOMMU, CWSR,
+`amdgpu-dkms`) is in
+[`docs/build-fixes.md` Fix 4](docs/build-fixes.md#fix-4-mes-0x83-firmware-regression-the-actual-root-cause-of-the-page-fault).
+For the layered post-install test ladder, see
+[`docs/validation-tests.md`](docs/validation-tests.md) or just
+`make validate`.
+
+> **`0x83` won't be the last MES regression.** The MES subsystem has a
+> track record of breakage across multiple firmware *and* kernel
+> revisions on RDNA3+ (`gfx11_5_1` includes `gfx1151`). There is even
+> a *separate*, kernel-side MES bug (`MES failed to respond to
+> msg=MISC (WAIT_REG_MEM)`, bisected to upstream commit `e356d321d024`,
+> mainline since 6.10) that surfaces with otherwise-good firmware.
+> When the next regression lands, see
+> [`docs/build-fixes.md` Fix 4 "Future-proofing"](docs/build-fixes.md#future-proofing-this-is-the-current-known-good-combination-not-a-permanent-one)
+> for the playbook (rollback procedure, alternative firmware revisions,
+> tracker links). Run `./scripts/install-mes-firmware.sh --list-known`
+> for the live table of community-tested versions.
+
+### 2. Kernel cmdline baseline (recommended)
+
+Not strictly required (Fix 1 above is what unblocks GPU compute), but the
+AMD-recommended baseline for compute on a UMA APU. It removes one
+variable from any future debugging.
 
 ```bash
 cat /proc/cmdline | tr ' ' '\n' | grep --extended-regexp 'iommu|amdgpu'
 ```
 
-If you see `amd_iommu=off`, fix `/etc/default/grub`:
+If you see `amd_iommu=off` or `amdgpu.cwsr_enable=0`, fix
+`/etc/default/grub`:
 
 ```bash
 sudo --edit /etc/default/grub
-# In GRUB_CMDLINE_LINUX_DEFAULT:
-#   - REMOVE: amd_iommu=off
-#   - ADD:    iommu=pt
-# Recommended baseline for this box:
-# GRUB_CMDLINE_LINUX_DEFAULT="quiet splash thunderbolt.host_reset=0 iommu=pt"
-
+# Recommended GRUB_CMDLINE_LINUX_DEFAULT for this box:
+#   "quiet splash thunderbolt.host_reset=0 amd_iommu=on iommu=pt"
 sudo update-grub
 sudo reboot
 ```
 
-After reboot, verify a single `hipMemcpy` works:
+Why `iommu=pt` and not just `amd_iommu=on`: passthrough mode for kernel-
+managed DMA is the AMD-recommended setting for compute on UMA APUs (lower
+overhead, no IOMMU page walks for already-pinned kernel buffers, but full
+GTT support for user pages).
 
-```bash
-hipcc --offload-arch=gfx1151 -x c++ - -o /tmp/hip-smoke <<'EOF'
-#include <hip/hip_runtime.h>
-int main() {
-    int *d, h = 42; hipMalloc(&d, 4);
-    if (hipMemcpy(d, &h, 4, hipMemcpyHostToDevice) != hipSuccess) return 1;
-    return hipDeviceSynchronize() == hipSuccess ? 0 : 2;
-}
-EOF
-/tmp/hip-smoke && echo "GPU compute path healthy"
-```
+After both fixes are in place, run the host smoke test from
+[`docs/validation-tests.md`](docs/validation-tests.md#layer-2--host-hip-smoke-test-hipmemcpy--kernel-launch).
+It should print `out=12345` and exit `0`.
 
-If that exits 0, ROCm is healthy and the container will see
-`total_vram="96 GiB"` instead of `"0 B"`. See
-[`docs/build-fixes.md`](docs/build-fixes.md#fix-3-host-amd_iommuoff-blocks-all-gpu-memory-access)
-for the full diagnostic story.
-
-### 2. Stop the host `ollama` systemd service
+### 3. Stop the host `ollama` systemd service
 
 The host has Ubuntu's bundled `ollama` systemd service. It collides with this
 container on port `11434` and on the model store at `/usr/share/ollama/.ollama`.
@@ -94,7 +158,7 @@ sudo systemctl disable ollama
 sudo ss --tcp --listening --numeric --processes | grep 11434   # should be empty
 ```
 
-### 3. Container runtime sanity
+### 4. Container runtime sanity
 
 Confirm the user is in the `docker` group, the host has `/dev/kfd` and `/dev/dri`,
 and the AMDGPU kernel module is loaded:
@@ -263,11 +327,22 @@ Faulty UTCL2 client ID: CPF (0x4)
 WALKER_ERROR: 0x1, MAPPING_ERROR: 0x1, PERMISSION_FAULTS: 0x3
 ```
 
-This is `amd_iommu=off` on the kernel cmdline. The container's ROCm install
-is fine - this is a host kernel/grub setup issue. Re-do
-[Prerequisites § 1](#1-kernel-cmdline-must-enable-the-amd-iommu) and reboot.
+This is **almost always the buggy `0x83` MES firmware** in Ubuntu's
+`linux-firmware` package. The container's ROCm install is fine — this is
+a host firmware issue. Confirm with:
+
+```bash
+sudo cat /sys/kernel/debug/dri/1/amdgpu_firmware_info | grep '^MES feature'
+# BROKEN:  MES feature version: 1, firmware version: 0x00000083
+# OK:      MES feature version: 1, firmware version: 0x00000080  (or lower)
+```
+
+Re-do [Prerequisites § 1](#1-replace-ubuntus-broken-mes-firmware-on-strix-halo)
+and reboot. Far less likely (and not a complete fix on its own): the
+host kernel cmdline has `amd_iommu=off`; see
+[Prerequisites § 2](#2-kernel-cmdline-baseline-recommended).
 Full diagnostic story:
-[`docs/build-fixes.md` Fix 3](docs/build-fixes.md#fix-3-host-amd_iommuoff-blocks-all-gpu-memory-access).
+[`docs/build-fixes.md` Fix 4](docs/build-fixes.md#fix-4-mes-0x83-firmware-regression-the-actual-root-cause-of-the-page-fault).
 
 ### Container starts but `rocminfo` shows no GPU agent
 
@@ -284,6 +359,94 @@ your host's `render` and `video` group ids and update `group_add:` in
 ```bash
 getent group render video           # find the numeric ids
 ```
+
+### Host-installed Ollama runs on Vulkan or CPU instead of ROCm
+
+> **Container users can skip this** — the compose image is built with
+> the ROCm backend only.
+
+**Symptom.** The official installer succeeds, the API answers, but
+inference runs on Vulkan or CPU:
+
+```text
+... library=Vulkan compute=0.0 ...      # FAIL_VULKAN
+... library=cpu ...                     # FAIL_CPU
+```
+
+**Almost always the actual cause: [Fix 4 (MES `0x83` firmware
+regression)](docs/build-fixes.md#fix-4-mes-0x83-firmware-regression-the-actual-root-cause-of-the-page-fault).**
+When the `rocm` runner can't initialise (because the GPU page-faults
+on every compute kernel), Ollama's auto-selector falls back to Vulkan
+or CPU. The fallback masks the real failure - it looks like a
+backend-selection bug but it's a host kernel/firmware bug. Diagnose
+in this order:
+
+```bash
+make mes-check                   # 1. Is the MES firmware safe?
+                                 #    If "BROKEN: 0x83", fix it:
+make install-mes-firmware        # 2. Install pre-regression firmware
+sudo reboot                      # 3. Reload the kernel + firmware
+make validate --mode host        # 4. Re-validate; Layer 5 should PASS
+```
+
+**You almost certainly do NOT need a systemd override to "force ROCm".**
+On a healthy host (Fix 4 applied, Vulkan packages installed or not, no
+weird env vars set anywhere), Ollama 0.21.0 picks ROCm by itself. The
+`subprocess` line in `journalctl --unit=ollama` proves it:
+
+```text
+LD_LIBRARY_PATH=/usr/local/lib/ollama:/usr/local/lib/ollama/rocm     # <-- Ollama added this
+ROCR_VISIBLE_DEVICES=0                                                # <-- Ollama added this
+...
+load_backend: loaded ROCm backend from /usr/local/lib/ollama/rocm/libggml-hip.so
+```
+
+**The actual minimal `systemctl edit ollama.service` for this stack** -
+purely operational, no GPU-related env vars at all:
+
+```ini
+[Service]
+Environment="OLLAMA_HOST=0.0.0.0:11434"            # let LAN clients (e.g. OpenWebUI) reach it
+Environment="OLLAMA_DEBUG=2"                       # verbose logs for the validator
+Environment="OLLAMA_MODELS=/usr/share/ollama/.ollama/models"   # explicit; matches default
+```
+
+Verified working on the test box with `User=ollama`, no `OLLAMA_ROCM`,
+no `*_VISIBLE_DEVICES`, no `GGML_USE_ROCM`, no nothing else - and
+`make validate --mode host` passes Layer 5 with `library=ROCm
+compute=gfx1151`.
+
+**`User=ollama Group=ollama`** (the install-script default) is fine.
+`/dev/kfd` and `/dev/dri/renderD128` are mode `0666` on this hardware
+and the systemd unit inherits `render`/`video` via `initgroups(3)`. If
+Layer 5 fails *after* Fix 4 is verified safe, check the live process
+picked up the supplementary groups (the install script's
+`usermod -aG render,video ollama` only takes effect on a fresh exec,
+not on `systemctl restart` of an `Restart=always` unit):
+
+```bash
+sudo cat /proc/$(pgrep --exact ollama)/status | grep --extended-regexp '^(Uid|Gid|Groups):'
+# Healthy:
+#   Uid:    997 997 997 997
+#   Gid:    984 984 984 984
+#   Groups: 44 984 992          # <-- video=44, ollama=984, render=992
+
+# If 'Groups:' is empty, force a fresh exec:
+sudo systemctl daemon-reload
+sudo systemctl stop ollama.service
+sudo systemctl start ollama.service
+```
+
+> **Note on retracted advice.** Earlier versions of this section
+> recommended (a) switching to `User=root` and (b) setting
+> `OLLAMA_ROCM=1` + `GGML_USE_ROCM=1` + `*_VISIBLE_DEVICES`. **Both
+> were wrong** — controlled A/B tests on this box (drop each, see if
+> anything breaks) show neither makes any difference once Fix 4 is in
+> place. Full audit trail:
+> [`docs/build-fixes.md` Fix 5 → "What we got wrong"](docs/build-fixes.md#what-we-got-wrong).
+
+Full diagnostic story:
+[`docs/build-fixes.md` Fix 5](docs/build-fixes.md#fix-5-minimal-systemd-override-for-the-host-install-and-what-wasnt-actually-needed).
 
 ### `Error: HSA_STATUS_ERROR` or random hangs during generation
 
