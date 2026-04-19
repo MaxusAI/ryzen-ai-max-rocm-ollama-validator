@@ -6,7 +6,9 @@ MODEL          ?= gemma4:31b-it-q4_K_M
 CTX            ?= 262144
 HOST_PORT      ?= 11434
 
-.PHONY: help submodules build up down restart logs shell gpu-check ps test-fa rocm-smi clean-image
+.PHONY: help submodules build up down restart logs shell gpu-check ps test-fa rocm-smi clean-image \
+        validate validate-full validate-logged mes-check install-mes-firmware \
+        stress-test stress-test-quick run-history
 
 help: ## Show this help.
 	@awk 'BEGIN { FS = ":.*?## "; printf "Targets:\n" } \
@@ -72,3 +74,28 @@ test-fa: ## Fire one short generation at $(CTX) ctx, then classify the FA branch
 
 clean-image: ## Remove the built image (forces a full rebuild next time).
 	docker image rm amd-rocm-ollama:7.2.2 || true
+
+validate: ## Run the 9-layer validation ladder, skipping the slow Layer 8.
+	./scripts/validate.sh --skip-long-ctx
+
+validate-full: ## Run the full 9-layer validation including ~200K-token Layer 8 (slow).
+	./scripts/validate.sh
+
+mes-check: ## Quick check: is the running MES firmware safe (NOT the 0x83 regression)?
+	./scripts/install-mes-firmware.sh --check
+
+install-mes-firmware: ## Install the pre-regression MES firmware override (requires sudo, then reboot).
+	sudo ./scripts/install-mes-firmware.sh
+
+validate-logged: ## Run the full validator and append a JSONL record to logs/run-history.jsonl.
+	./scripts/log-run.sh -- ./scripts/validate.sh
+
+stress-test: ## VRAM/GTT/MES stress test: largest model, 4 parallel reqs at full ctx, logged.
+	./scripts/log-run.sh -- ./scripts/stress-test.sh
+
+stress-test-quick: ## Quick stress test: smaller model + smaller ctx (~5min, safe to run often).
+	./scripts/log-run.sh -- ./scripts/stress-test.sh \
+		--model $(MODEL) --num-ctx 32768 --concurrency 2 --requests 4
+
+run-history: ## Show the last 10 entries from the run-history log (jq required for pretty output).
+	@./scripts/log-run.sh show --last 10
