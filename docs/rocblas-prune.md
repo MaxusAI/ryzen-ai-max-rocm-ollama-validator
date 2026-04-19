@@ -51,18 +51,19 @@ MAPPING_ERROR=1` - the GPU's command processor was handed a stale code
 object pointer.)
 
 Note that the **same** kernel-log message is also produced by an entirely
-different host-side problem: `amd_iommu=off` on the kernel cmdline. See
-[build-fixes.md Fix 3](build-fixes.md#fix-3-host-amd_iommuoff-blocks-all-gpu-memory-access).
+different host-side problem: the MES `0x83` firmware regression in
+Ubuntu's `linux-firmware` package. See
+[build-fixes.md Fix 4](build-fixes.md#fix-4-mes-0x83-firmware-regression-the-actual-root-cause-of-the-page-fault).
 Distinguishing the two:
 
-| Symptom check                                         | Prune over-delete (Fix 2) | Host `amd_iommu=off` (Fix 3)   |
-| ----------------------------------------------------- | ------------------------- | ------------------------------ |
-| `cat /proc/cmdline \| grep amd_iommu`                 | absent or `iommu=pt`      | `amd_iommu=off`                |
-| `hipcc` minimal `hipMemcpy` test on the host          | passes                    | also fails / hangs             |
-| `ls /usr/lib/ollama/rocm/rocblas/library \| grep -v gfx \| wc -l` | 1 (only manifest)  | 55 (manifest + 54 fallbacks) |
+| Symptom check                                                        | Prune over-delete (Fix 2)   | Host MES `0x83` (Fix 4)            |
+| -------------------------------------------------------------------- | --------------------------- | ---------------------------------- |
+| `sudo cat /sys/kernel/debug/dri/1/amdgpu_firmware_info \| grep MES` | `MES … 0x80` or lower (OK)  | `MES … 0x83` (BROKEN)              |
+| Host-only `hipcc` smoke test (no Docker)                             | passes                      | also fails identically             |
+| `ls /usr/lib/ollama/rocm/rocblas/library \| grep -v gfx \| wc -l`   | 1 (only manifest)           | 55 (manifest + 54 fallbacks)       |
 
 If both look healthy and you still see the crash, that's a third unknown
-problem - file an issue with the dmesg + container logs.
+problem — file an issue with the dmesg + container logs.
 
 ## File-name taxonomy in ROCm 7.2.2 rocBLAS
 
@@ -165,7 +166,7 @@ If any of those happen, the failure mode at runtime is one of:
 
 - `rocBLAS error: Cannot read from file ...` during the first GEMM call
 - A repeat of the `Memory access fault by GPU node-1 ...` page fault from
-  the original prune bug (see [build-fixes.md Fix 2](build-fixes.md#fix-2-rocblas-prune-pattern--flip-from-keep-gfx1151-to-drop-other-arches))
+  the original prune bug (see [build-fixes.md Fix 2](build-fixes.md#fix-2-rocblas-prune-pattern---flip-from-keep-gfx1151-to-drop-other-arches))
 - A silent fallback to a slower path with no error message but visibly
   worse tokens/sec
 
