@@ -13,6 +13,11 @@ support.
 **Clone:** use `git clone --recursive <url>` **or** run `make submodules` before
 `make build` / `docker compose build` so `external/ollama/` is populated.
 
+**Per-host overrides:** copy [`.env.example`](.env.example) to `.env` and edit
+`VIDEO_GID`, `RENDER_GID`, `OLLAMA_MODEL_STORE` if your machine differs from the
+defaults (Ubuntu 24.04, video=44, render=992, model store at
+`/usr/share/ollama/.ollama`). `.env` is gitignored.
+
 - No Vulkan, no CUDA, no NVIDIA paths.
 - Mounts the host model store at `/usr/share/ollama/.ollama` so existing pulls
   (e.g. `gemma4:31b-it-q4_K_M`) work immediately.

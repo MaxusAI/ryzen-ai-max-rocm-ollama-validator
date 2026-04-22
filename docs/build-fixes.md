@@ -476,7 +476,7 @@ trail on each.
 > **Container users can skip this.** The container runs as root and
 > joins the `video`/`render` groups via `docker-compose.yml`'s
 > `group_add:`, so this section is purely a host-install note.
-
+>
 > **Heads up — this section has been rewritten *twice* after direct
 > observation on the test box disproved earlier theories.** First we
 > claimed `User=root` was required (wrong). Then we claimed
@@ -508,7 +508,7 @@ specific verdicts `FAIL_CPU` or `FAIL_VULKAN`.
 
 **The minimum the host install needs.** Once the host kernel is
 healthy ([Fix 3](#fix-3-iommu-baseline-not-the-actual-page-fault-fix---see-fix-4)
-+ [Fix 4](#fix-4-mes-0x83-firmware-regression-the-actual-root-cause-of-the-page-fault)),
+and [Fix 4](#fix-4-mes-0x83-firmware-regression-the-actual-root-cause-of-the-page-fault)),
 `curl https://ollama.com/install.sh | sh` followed by `ollama pull
 some-model` followed by `ollama run some-model` works. **No systemd
 override is required to get ROCm.** We verified this on the test box

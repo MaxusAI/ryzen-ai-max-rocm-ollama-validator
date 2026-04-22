@@ -18,10 +18,11 @@ __pycache__/
 docker-compose.override.yml
 docker-compose.local.yml
 
-# Local env files (avoid leaking secrets). No .env.example carve-out: this
-# stack reads its env directly from docker-compose.yml, no .env shim needed.
+# Local env files (avoid leaking secrets). .env.example is tracked as a
+# template (host-specific GIDs and model store path); .env is per-machine.
 .env
 .env.*
+!.env.example
 
 # Per-machine runtime artifacts from log-run.sh / validate.sh / stress-test.sh.
 # The JSONL records embed host-specific data (hostname, kernel, MES firmware,

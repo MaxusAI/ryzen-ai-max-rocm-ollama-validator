@@ -8,6 +8,7 @@ to find the actual breakage thresholds. All numbers from one box:
 - Linux 6.14.0-1018-oem, MES firmware `0x7c` (post-`0x83` regression).
 - Host Ollama 0.21.0 (curl-installed), built against ROCm 7.2.1.
 - Override:
+
   ```ini
   Environment="OLLAMA_FLASH_ATTENTION=1"
   Environment="OLLAMA_KV_CACHE_TYPE=q8_0"

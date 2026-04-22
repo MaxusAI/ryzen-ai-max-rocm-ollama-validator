@@ -23,14 +23,18 @@ services:
       - "/dev/kfd"
       - "/dev/dri"
 
-    # Numeric ids match the host: video=44, render=992. Names are also added so
-    # this still works on hosts where /etc/group inside the image happens to
-    # define them at different ids.
+    # Numeric ids must match the HOST's /etc/group for /dev/kfd and the active
+    # /dev/dri/renderD* node. Defaults below match Ubuntu 24.04 on the test box
+    # (video=44, render=992); override per-host with a .env file at repo root:
+    #   VIDEO_GID=$(getent group video  | cut -d: -f3)
+    #   RENDER_GID=$(getent group render | cut -d: -f3)
+    # Group names are kept too so it still works on hosts where the image's
+    # /etc/group happens to define matching names at different ids.
     group_add:
       - "video"
       - "render"
-      - "44"
-      - "992"
+      - "${VIDEO_GID:-44}"
+      - "${RENDER_GID:-992}"
 
     cap_add:
       - "SYS_PTRACE"
@@ -44,10 +48,13 @@ services:
       - "11434:11434"
 
     volumes:
-      # Bind-mount the host's existing model store. Container runs as root and
-      # writes new pulls/manifests as root - that is fine because we disabled
-      # the host's ollama systemd service. See README for re-chown instructions.
-      - "/usr/share/ollama/.ollama:/root/.ollama"
+      # Bind-mount the host's existing model store. Default matches Ubuntu's
+      # bundled ollama package; override with OLLAMA_MODEL_STORE in .env if
+      # your host (or distro) keeps models elsewhere. Container runs as root
+      # and writes new pulls/manifests as root - that is fine because we
+      # disabled the host's ollama systemd service. See README for re-chown
+      # instructions before re-enabling the host service.
+      - "${OLLAMA_MODEL_STORE:-/usr/share/ollama/.ollama}:/root/.ollama"
 
     environment:
       OLLAMA_HOST: "0.0.0.0:11434"

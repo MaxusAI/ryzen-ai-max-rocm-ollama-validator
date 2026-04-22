@@ -1,0 +1,83 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  shellcheck:
+    name: shellcheck (scripts/)
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout (without submodule)
+        uses: actions/checkout@v4
+
+      # Severity is `error` so the existing acknowledged warnings (unused
+      # parser placeholders, sudo-redirect pattern in validate.sh, etc.) do
+      # not block CI. Real syntax/quoting bugs still fail the run.
+      - name: Run ShellCheck
+        uses: ludeeus/action-shellcheck@2.0.0
+        env:
+          SHELLCHECK_OPTS: >-
+            --severity=error
+            --shell=bash
+            --external-sources
+        with:
+          scandir: ./scripts
+          ignore_paths: external
+
+  markdownlint:
+    name: markdownlint (root + docs/)
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout (without submodule)
+        uses: actions/checkout@v4
+
+      # Cosmetic rules (line length, tags, table alignment, fence language)
+      # are disabled; lint focuses on structural issues (broken refs, bad
+      # headings, etc.). Existing docs use non-aligned tables and language-
+      # less terminal blocks intentionally.
+      - name: Write markdownlint config
+        run: |
+          cat > .markdownlint.jsonc <<'JSON'
+          {
+            "default": true,
+            "MD013": false,
+            "MD024": { "siblings_only": true },
+            "MD033": false,
+            "MD040": false,
+            "MD041": false,
+            "MD060": false
+          }
+          JSON
+
+      - name: Run markdownlint
+        uses: DavidAnson/markdownlint-cli2-action@v16
+        with:
+          globs: |
+            *.md
+            docs/**/*.md
+            scripts/README.md
+            .github/**/*.md
+
+  compose-config:
+    name: docker compose config validates
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout (without submodule)
+        uses: actions/checkout@v4
+
+      - name: docker compose config (defaults)
+        run: docker compose config --quiet
+
+      - name: docker compose config (with .env.example)
+        run: |
+          cp .env.example .env
+          docker compose config --quiet
+          rm .env
