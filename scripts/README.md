@@ -132,8 +132,9 @@ HOST_PORT=11434                     # API port to probe
 COMPOSE_SERVICE=ollama              # docker compose service name (alias: SERVICE)
 COMPOSE_FILE=./docker-compose.yml
 IMAGE_TAG=amd-rocm-ollama:7.2.2     # Layer 3 image tag
-SMOKE_MODEL=gemma4:e4b-it-q4_K_M    # Layer 6 model
-LONG_CTX_MODEL=...  LONG_CTX_TOKENS=200000   # Layer 8
+SMOKE_MODEL=llama3.2:latest         # Layer 6 preferred (auto-falls back to smallest installed)
+LONG_CTX_MODEL=gemma4:e4b-it-q4_K_M # Layer 8 preferred (auto-falls back to largest >=128K-ctx model)
+LONG_CTX_TOKENS=200000              # Layer 8 prompt size target
 DRI_INDEX=1                         # which /sys/kernel/debug/dri/N/
 MODE=auto                           # auto|container|host (alias for --mode)
 ```

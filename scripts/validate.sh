@@ -60,8 +60,16 @@ HIP_TEST_SRC="${HIP_TEST_SRC:-${REPO_ROOT}/scripts/hip-kernel-test.cpp}"
 # Set this env var explicitly only if you want to inspect the binary after.
 HIP_TEST_BIN="${HIP_TEST_BIN:-}"
 LONG_CTX_OUT="${LONG_CTX_OUT:-/tmp/long_ctx_validate.out}"
-SMOKE_MODEL="${SMOKE_MODEL:-llama3.2:latest}"
-LONG_CTX_MODEL="${LONG_CTX_MODEL:-gemma4:e4b-it-q4_K_M}"   # capped at 128K but works
+# Model preferences. These are the historical defaults and act as the FIRST
+# choice if the user has them pulled. If the env var is unset OR the named
+# model isn't installed, _resolve_smoke_model / _resolve_long_ctx_model
+# auto-pick whatever IS available (smallest installed for smoke, largest
+# >=128K-context model for long-ctx). Everyone gets a useful run regardless
+# of which Gemma/Llama/Qwen tag they've pulled.
+SMOKE_MODEL_PREFERRED="${SMOKE_MODEL:-llama3.2:latest}"
+LONG_CTX_MODEL_PREFERRED="${LONG_CTX_MODEL:-gemma4:e4b-it-q4_K_M}"
+SMOKE_MODEL=""           # resolved at Layer 6 entry, see _resolve_smoke_model
+LONG_CTX_MODEL=""        # resolved at Layer 8 entry, see _resolve_long_ctx_model
 LONG_CTX_TOKENS="${LONG_CTX_TOKENS:-200000}"
 LONG_CTX_NUM_CTX="${LONG_CTX_NUM_CTX:-262144}"
 IMAGE_TAG="${IMAGE_TAG:-amd-rocm-ollama:7.2.2}"
@@ -981,6 +989,66 @@ layer_5_finalize() {
     fi
 }
 
+# _resolve_smoke_model <preferred> - print the model name to use for the
+# Layer 6 smoke test, picking in priority order:
+#   1. <preferred> (env var SMOKE_MODEL or historical default) if installed
+#   2. api_smallest_model (whatever the user has, even if it's not Llama 3.2)
+#   3. "" if no models installed at all
+_resolve_smoke_model() {
+    local preferred="$1" size_b
+    if [ -n "$preferred" ]; then
+        size_b=$(api_model_size_bytes "$preferred")
+        if [ "${size_b:-0}" -gt 0 ]; then
+            printf '%s' "$preferred"
+            return
+        fi
+    fi
+    api_smallest_model
+}
+
+# _resolve_long_ctx_model <preferred> - print the model name to use for the
+# Layer 8 long-context test:
+#   1. <preferred> if installed
+#   2. largest installed model whose declared max_context >= 128K
+#   3. api_largest_model as a last resort (Layer 8 will accept truncation)
+#   4. "" if no models installed
+_resolve_long_ctx_model() {
+    local preferred="$1" size_b
+    if [ -n "$preferred" ]; then
+        size_b=$(api_model_size_bytes "$preferred")
+        if [ "${size_b:-0}" -gt 0 ]; then
+            printf '%s' "$preferred"
+            return
+        fi
+    fi
+    # Walk installed models from largest to smallest, return first one
+    # advertising at least 128K context. Capped at 8 candidates to bound
+    # the per-model /api/show wall time (each call is ~50-150 ms).
+    local names name max_ctx checked=0
+    names=$(curl --silent --max-time 5 "$(_api_url)/api/tags" 2>/dev/null \
+        | python3 -c 'import json,sys
+try:
+    d = json.loads(sys.stdin.read())
+except Exception:
+    print(""); sys.exit(0)
+ms = sorted(d.get("models",[]), key=lambda m: -m.get("size", 0))
+for m in ms[:8]:
+    print(m["name"])')
+    while IFS= read -r name; do
+        [ -z "$name" ] && continue
+        checked=$((checked + 1))
+        max_ctx=$(api_model_max_context "$name")
+        if [ "${max_ctx:-0}" -ge 131072 ]; then
+            printf '%s' "$name"
+            return
+        fi
+    done <<< "$names"
+    # No 128K-capable model among the top 8; settle for the biggest installed.
+    if [ "$checked" -gt 0 ]; then
+        api_largest_model
+    fi
+}
+
 # Tiny model load helper for host-mode Layer 5: load whatever's smallest
 # so we don't blow VRAM on a Layer-5 sanity check on machines where the
 # largest model is half a TB.
@@ -1004,7 +1072,17 @@ api_load_tiny_model() {
 # ---------------------------------------------------------------------------
 
 layer_6() {
+    SMOKE_MODEL=$(_resolve_smoke_model "$SMOKE_MODEL_PREFERRED")
+    if [ -z "$SMOKE_MODEL" ]; then
+        print_header 6 "Small-model inference smoke test (no model resolved)"
+        skip 6 "no installed models found via /api/tags" \
+            "Pull a small model and re-run, e.g.: ollama pull llama3.2:latest"
+        return
+    fi
     print_header 6 "Small-model inference smoke test ($SMOKE_MODEL)"
+    if [ "$SMOKE_MODEL" != "$SMOKE_MODEL_PREFERRED" ]; then
+        info "preferred model '$SMOKE_MODEL_PREFERRED' not installed; auto-picked smallest: $SMOKE_MODEL"
+    fi
     if ! prereq_passed 5 && [ -z "$ONLY_LAYER" ]; then
         skip 6 "Layer 5 (GPU discovery) failed"
         return
@@ -1078,13 +1156,42 @@ layer_7() {
     total_g=$(awk "BEGIN { printf \"%.1f\", ${total_b}/1024/1024/1024 }")
     free_g=$(awk "BEGIN { printf \"%.1f\", ${free_b}/1024/1024/1024 }")
     info "VRAM total=${total_g} GiB  free=${free_g} GiB"
-    info "256K worst-case budget for gemma4:31b-q4_K_M: ~43 GiB (weights ~20 + KV f16 ~20 + overhead)"
-    rm --force /tmp/_rocm_vram.csv
-    if awk "BEGIN { exit !(${total_g} >= 50) }"; then
-        pass 7 "VRAM total ${total_g} GiB is sufficient for 256K context"
+    # Try to size the budget against the actual model the user will hit at
+    # Layer 8. Fall back to the historical hardcoded gemma4:31b figure if
+    # no long-ctx model is resolvable yet.
+    local resolved size_b size_g max_ctx target_ctx kv_g budget_g recommended_g
+    resolved=$(_resolve_long_ctx_model "$LONG_CTX_MODEL_PREFERRED")
+    if [ -n "$resolved" ]; then
+        size_b=$(api_model_size_bytes "$resolved")
+        max_ctx=$(api_model_max_context "$resolved")
+        target_ctx=$LONG_CTX_NUM_CTX
+        # Cap at the model's own max if it's lower than our test request
+        # (e.g. gemma4:e4b is 128K-capped; budget at 128K, not 256K).
+        if [ "${max_ctx:-0}" -gt 0 ] && [ "$max_ctx" -lt "$target_ctx" ]; then
+            target_ctx=$max_ctx
+        fi
+        size_g=$(awk "BEGIN { printf \"%.1f\", ${size_b:-0}/1024/1024/1024 }")
+        # Rough KV cache estimate at f16: ~80 KiB / token for a typical
+        # 30B-ish quant. Scales linearly with target_ctx. Order-of-magnitude
+        # only - tells the user "enough room?" not exact bytes.
+        kv_g=$(awk "BEGIN { printf \"%.1f\", ${target_ctx} * 80 / 1024 / 1024 }")
+        budget_g=$(awk "BEGIN { printf \"%.1f\", ${size_g} + ${kv_g} + 3 }")
+        recommended_g=$(awk "BEGIN { printf \"%.1f\", ${budget_g} + 5 }")
+        info "long-ctx model: $resolved (~${size_g} GiB on disk, max_ctx=${max_ctx})"
+        info "worst-case budget at ctx=${target_ctx}: ~${budget_g} GiB (weights ~${size_g} + KV f16 ~${kv_g} + overhead ~3)"
     else
-        fail 7 "VRAM total ${total_g} GiB is below the recommended 50 GiB" \
-            "Increase BIOS UMA split for the iGPU"
+        # No model installed yet - fall back to the historical reference figures.
+        budget_g=43
+        recommended_g=50
+        info "no long-ctx model installed; using reference budget for gemma4:31b-q4_K_M at 256K"
+        info "256K worst-case budget for gemma4:31b-q4_K_M: ~43 GiB (weights ~20 + KV f16 ~20 + overhead)"
+    fi
+    rm --force /tmp/_rocm_vram.csv
+    if awk "BEGIN { exit !(${total_g} >= ${recommended_g}) }"; then
+        pass 7 "VRAM total ${total_g} GiB is sufficient (>= ${recommended_g} GiB recommended for budget ~${budget_g} GiB)"
+    else
+        fail 7 "VRAM total ${total_g} GiB is below the recommended ${recommended_g} GiB for budget ~${budget_g} GiB" \
+            "Increase BIOS UMA split for the iGPU, or pick a smaller LONG_CTX_MODEL"
     fi
 }
 
@@ -1093,7 +1200,17 @@ layer_7() {
 # ---------------------------------------------------------------------------
 
 layer_8() {
+    LONG_CTX_MODEL=$(_resolve_long_ctx_model "$LONG_CTX_MODEL_PREFERRED")
+    if [ -z "$LONG_CTX_MODEL" ]; then
+        print_header 8 "Long-context inference (no model resolved)"
+        skip 8 "no installed models found via /api/tags" \
+            "Pull a long-context-capable model, e.g.: ollama pull gemma4:31b-it-q4_K_M"
+        return
+    fi
     print_header 8 "Long-context inference (~${LONG_CTX_TOKENS} tokens, model: $LONG_CTX_MODEL)"
+    if [ "$LONG_CTX_MODEL" != "$LONG_CTX_MODEL_PREFERRED" ]; then
+        info "preferred model '$LONG_CTX_MODEL_PREFERRED' not installed; auto-picked: $LONG_CTX_MODEL"
+    fi
     if [ "$SKIP_LONG_CTX" -eq 1 ]; then
         skip 8 "skipped via --skip-long-ctx"
         return

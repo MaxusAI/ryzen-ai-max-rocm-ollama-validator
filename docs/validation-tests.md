@@ -28,7 +28,7 @@ Layer 8 passes.
 | 5     | Ollama bootstrap discovery sees the GPU | 5 s    | Container saw `library=ROCm`, not silent CPU fallback |
 | 6     | Small inference (`llama3.2`)            | 5 s    | End-to-end token generation                           |
 | 7     | Memory math at 256K                     | 1 s    | Confirms VRAM headroom for the target context         |
-| 8     | Long-context inference (~`LONG_CTX_TOKENS` char budget, default 200K) | 4-25 m | Pass = HTTP OK + positive `prompt_eval_count` (actual tokens depend on model caps) |
+| 8     | Long-context inference (~`LONG_CTX_TOKENS` char budget, default 200K) | 4-25 m | Pass = HTTP OK + positive `prompt_eval_count` (actual tokens depend on model caps; model auto-resolves to largest installed >=128K-ctx if `LONG_CTX_MODEL` not pulled) |
 
 Numbers in this doc were captured on:
 
