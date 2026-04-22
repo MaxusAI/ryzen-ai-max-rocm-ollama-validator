@@ -5,18 +5,28 @@
 #   1. Prereq check         (docker, docker compose, render/video groups)
 #   2. Submodule init       (idempotent; populates external/ollama if missing)
 #   3. .env scaffold        (copy from .env.example if absent; print detected GIDs)
-#   4. Image present check  (FAIL FAST if amd-rocm-ollama:7.2.2 not built; --build to opt in)
-#   5. docker compose up    (detached) + wait for /api/tags healthcheck
+#   4. Endpoint detection   (probe :11434; pick HOST | CONTAINER | OTHER mode)
+#   5. Bring-up (only if nothing is on :11434):
+#        - image present check (FAIL FAST unless --build given)
+#        - docker compose up + wait for /api/tags
 #   6. Auto-pull smoke      (llama3.2:latest, ~2 GiB, ONLY if no models installed; --no-pull to suppress)
-#   7. ./scripts/validate.sh --skip-long-ctx (layers 0-7; Layer 8 stays opt-in via make validate-full)
+#   7. ./scripts/validate.sh --skip-long-ctx --mode <host|container>
 #   8. Footer with next-step hints
+#
+# Mode selection (printed loudly before validate runs):
+#   - if our compose container is already on :11434 -> CONTAINER (reuses it)
+#   - if host systemd 'ollama.service' is on :11434 -> HOST       (no container started)
+#   - if anything else is on :11434                 -> OTHER      (validates the live API anyway)
+#   - if nothing is on :11434                       -> CONTAINER  (brings the stack up)
+#   --build forces CONTAINER and refuses to start if :11434 is held by something else.
 #
 # Flags:
 #   --build         Run `docker compose build` before `up` (~30 min on first run).
+#                   Forces CONTAINER mode; aborts if :11434 is bound by host ollama.
 #   --no-build      Explicit no-op for clarity in scripts (default).
 #   --no-pull       Skip the auto-pull of llama3.2:latest even if no models are installed.
 #   --skip-up       Don't start/build the container; validate whatever's already running
-#                   (use this to validate a host-installed ollama instead).
+#                   (use this to force HOST mode against a host-installed ollama).
 #   --help, -h      Show this message.
 #
 # Exit codes:
@@ -84,6 +94,38 @@ _port_listener() {
     elif command -v lsof >/dev/null 2>&1; then
         lsof -nP -iTCP:"${port}" -sTCP:LISTEN 2>/dev/null
     fi
+}
+
+# _api_alive <port> - 0 if /api/tags responds within 2s, 1 otherwise.
+_api_alive() {
+    curl --silent --max-time 2 --fail --output /dev/null \
+        "http://localhost:${1}/api/tags"
+}
+
+# _detect_endpoint_mode - print one of: container | host | other | ""
+# Empty string means "nothing on :HOST_PORT, free to bring our own up".
+# Decision order: our compose container > host systemd > anything else.
+_detect_endpoint_mode() {
+    if ! _api_alive "$HOST_PORT" && [ -z "$(_port_listener "$HOST_PORT")" ]; then
+        printf ''
+        return
+    fi
+    # Something is on the port. Figure out who.
+    local cid state
+    cid="$(cd "$REPO_ROOT" && $COMPOSE ps --quiet "$SERVICE" 2>/dev/null | head --lines 1)"
+    if [ -n "$cid" ]; then
+        state="$(docker inspect --format '{{.State.Running}}' "$cid" 2>/dev/null || printf 'false')"
+        if [ "$state" = "true" ]; then
+            printf 'container'
+            return
+        fi
+    fi
+    if command -v systemctl >/dev/null 2>&1 \
+            && systemctl is-active --quiet ollama 2>/dev/null; then
+        printf 'host'
+        return
+    fi
+    printf 'other'
 }
 
 # ---------------------------------------------------------------------------
@@ -180,10 +222,74 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# step 4: build / image presence
+# step 4: endpoint detection
+#
+# Decide WHAT we are validating before we touch docker. Three signals matter:
+#   - is anything answering /api/tags on :HOST_PORT ?
+#   - does our compose container own that listener?
+#   - is host systemd 'ollama.service' the one binding it?
+# The mode picked here drives both the auto-pull transport (compose exec vs
+# HTTP /api/pull) and the --mode flag passed to validate.sh.
 # ---------------------------------------------------------------------------
 
-if [ "$DO_UP" -eq 1 ]; then
+header "Endpoint detection (:${HOST_PORT})"
+
+DETECTED="$(_detect_endpoint_mode)"
+LISTENER_INFO="$(_port_listener "$HOST_PORT")"
+MODE=""              # final decision: container | host | other
+SHOULD_BRING_UP=0    # do we need `compose up` later?
+
+case "$DETECTED" in
+    container)
+        ok "our compose container '${SERVICE}' is already on :${HOST_PORT}"
+        info "reusing it - no build / no up"
+        MODE="container"
+        ;;
+    host)
+        if [ "$DO_BUILD" -eq 1 ]; then
+            err "host systemd 'ollama.service' is binding :${HOST_PORT}, but --build was given"
+            err "--build implies CONTAINER mode; free the port first:"
+            info "  sudo systemctl stop ollama && sudo systemctl disable ollama"
+            info "then re-run:  ./quickstart.sh --build"
+            exit 1
+        fi
+        ok "host systemd 'ollama.service' is running on :${HOST_PORT}"
+        info "preferring HOST ollama (no container will be started)"
+        info "to test the container instead: sudo systemctl stop ollama && ./quickstart.sh"
+        MODE="host"
+        ;;
+    other)
+        if [ "$DO_BUILD" -eq 1 ]; then
+            err ":${HOST_PORT} is bound by something we did not start, but --build was given:"
+            printf '%s\n' "$LISTENER_INFO" | sed 's/^/         /'
+            err "free the port first or drop --build"
+            exit 1
+        fi
+        ok ":${HOST_PORT} is responding (not our container, not host systemd)"
+        if [ -n "$LISTENER_INFO" ]; then
+            info "current listener:"
+            printf '%s\n' "$LISTENER_INFO" | sed 's/^/         /'
+        fi
+        info "validating whatever is on :${HOST_PORT} as-is"
+        MODE="other"
+        ;;
+    "")
+        if [ "$DO_UP" -eq 0 ]; then
+            err "no ollama on :${HOST_PORT} and --skip-up was given - nothing to validate"
+            info "drop --skip-up to bring up the container, or start a host ollama first"
+            exit 1
+        fi
+        ok ":${HOST_PORT} is free - will bring up the compose container"
+        MODE="container"
+        SHOULD_BRING_UP=1
+        ;;
+esac
+
+# ---------------------------------------------------------------------------
+# step 5: bring-up (only when we picked CONTAINER and nothing is up yet)
+# ---------------------------------------------------------------------------
+
+if [ "$SHOULD_BRING_UP" -eq 1 ]; then
     header "Container image"
 
     if [ "$DO_BUILD" -eq 1 ]; then
@@ -201,24 +307,20 @@ if [ "$DO_UP" -eq 1 ]; then
         fi
     fi
 
-    # ---------------------------------------------------------------------
-    # step 5: bring up + wait for healthcheck
-    # ---------------------------------------------------------------------
-
     header "docker compose up"
 
-    # Pre-flight: bail early if HOST_PORT is already bound. The most common
-    # cause is the host's bundled ollama systemd service - the README's
-    # PREREQUISITE - still being active.
-    listener=$(_port_listener "$HOST_PORT")
-    if [ -n "$listener" ]; then
-        err "port ${HOST_PORT} on the host is already in use:"
-        printf '%s\n' "$listener" | sed 's/^/         /'
+    # Re-check the port right before `up`. Detection ran a few seconds ago,
+    # and a host service / another container may have grabbed :HOST_PORT in
+    # the interim - in that case docker emits a generic 'address already in
+    # use' that gives no hint about the cause.
+    LISTENER_INFO="$(_port_listener "$HOST_PORT")"
+    if [ -n "$LISTENER_INFO" ]; then
+        err "port ${HOST_PORT} on the host became busy since detection:"
+        printf '%s\n' "$LISTENER_INFO" | sed 's/^/         /'
         if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet ollama 2>/dev/null; then
-            err "the host's bundled 'ollama' systemd service is running and binding :${HOST_PORT}"
-            info "fix it once:  sudo systemctl stop ollama && sudo systemctl disable ollama"
-            info "then re-run:  ./quickstart.sh"
-            info "(see README 'Compose / security' note for context)"
+            err "the host's bundled 'ollama' systemd service is binding :${HOST_PORT}"
+            info "stop it once:  sudo systemctl stop ollama && sudo systemctl disable ollama"
+            info "or re-run quickstart with no flags to use the host ollama instead"
         else
             info "free port ${HOST_PORT} or run with a different port: HOST_PORT=11500 ./quickstart.sh"
         fi
@@ -235,28 +337,17 @@ if [ "$DO_UP" -eq 1 ]; then
     info "waiting for /api/tags on http://localhost:${HOST_PORT} (up to 90s)"
     deadline=$(( $(date +%s) + 90 ))
     while [ "$(date +%s)" -lt "$deadline" ]; do
-        if curl --silent --max-time 2 --fail --output /dev/null \
-                "http://localhost:${HOST_PORT}/api/tags"; then
+        if _api_alive "$HOST_PORT"; then
             ok "ollama API is responding"
             break
         fi
         sleep 2
     done
-    if ! curl --silent --max-time 2 --fail --output /dev/null \
-            "http://localhost:${HOST_PORT}/api/tags"; then
+    if ! _api_alive "$HOST_PORT"; then
         err "ollama API did not respond within 90s"
         info "check logs: $COMPOSE logs --tail 100 $SERVICE"
         exit 1
     fi
-else
-    header "Bring-up"
-    info "skipping build / docker compose up (--skip-up); validating against whatever is already on http://localhost:${HOST_PORT}"
-    if ! curl --silent --max-time 2 --fail --output /dev/null \
-            "http://localhost:${HOST_PORT}/api/tags"; then
-        err "no ollama API on http://localhost:${HOST_PORT} - start your host ollama (or drop --skip-up)"
-        exit 1
-    fi
-    ok "ollama API is responding"
 fi
 
 # ---------------------------------------------------------------------------
@@ -281,10 +372,10 @@ elif [ "$DO_PULL" -eq 0 ]; then
 else
     info "no models installed; pulling $SMOKE_PULL_MODEL (~2 GiB) so the smoke test has something to load"
     info "use --no-pull next time to skip this"
-    if [ "$DO_UP" -eq 1 ]; then
+    if [ "$MODE" = "container" ]; then
         $COMPOSE exec -T "$SERVICE" ollama pull "$SMOKE_PULL_MODEL"
     else
-        # --skip-up path: hit the API directly, no docker exec
+        # host / other: no docker exec, hit the API directly
         curl --no-progress-meter --fail --max-time 600 \
             --request POST \
             --header 'content-type: application/json' \
@@ -298,10 +389,30 @@ fi
 # step 7: validate ladder
 # ---------------------------------------------------------------------------
 
+header "Validation target"
+
+case "$MODE" in
+    container)
+        info "mode      = CONTAINER  (docker compose service '${SERVICE}', image ${IMAGE_TAG})"
+        VALIDATE_MODE="container" ;;
+    host)
+        info "mode      = HOST       (ollama running on the host, outside any container)"
+        VALIDATE_MODE="host" ;;
+    other)
+        info "mode      = OTHER      (an ollama-compatible API on :${HOST_PORT} we did not start)"
+        # validate.sh has no 'other' bucket; treat it like host (no compose
+        # ownership assumptions, no docker logs).
+        VALIDATE_MODE="host" ;;
+    *)
+        err "internal error: MODE='$MODE' is not container|host|other"
+        exit 1 ;;
+esac
+info "endpoint  = http://localhost:${HOST_PORT}"
+
 header "Validation ladder (layers 0-7; Layer 8 needs 'make validate-full')"
 
 VALIDATE_RC=0
-"${REPO_ROOT}/scripts/validate.sh" --skip-long-ctx || VALIDATE_RC=$?
+"${REPO_ROOT}/scripts/validate.sh" --mode "$VALIDATE_MODE" --skip-long-ctx || VALIDATE_RC=$?
 
 # ---------------------------------------------------------------------------
 # step 8: footer
@@ -310,7 +421,12 @@ VALIDATE_RC=0
 header "Quickstart complete"
 
 if [ "$VALIDATE_RC" -eq 0 ]; then
-    ok "all selected layers passed"
+    ok "all selected layers passed (validated: ${MODE})"
+    if [ "$MODE" = "container" ]; then
+        PULL_HINT="docker compose exec ${SERVICE} ollama pull gemma4:31b-it-q4_K_M"
+    else
+        PULL_HINT="ollama pull gemma4:31b-it-q4_K_M"
+    fi
     cat <<EOF
 
   Next steps:
@@ -320,11 +436,11 @@ if [ "$VALIDATE_RC" -eq 0 ]; then
     make stress-test-quick   # safe ~5-min stress (concurrency=2, ctx=32K)
 
   Pull a long-context model for the headline test:
-    docker compose exec ${SERVICE} ollama pull gemma4:31b-it-q4_K_M
+    ${PULL_HINT}
 
 EOF
 else
-    err "validate.sh exited with code ${VALIDATE_RC} - check the [FAIL] lines above"
+    err "validate.sh exited with code ${VALIDATE_RC} (mode=${MODE}) - check the [FAIL] lines above"
     cat <<EOF
 
   Next steps:
